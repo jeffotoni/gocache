@@ -172,3 +172,20 @@ func (c *Cache) cleanup() {
 		}
 	}
 }
+
+// Clear removes all keys from all shards and resets the ring buffers.
+func (c *Cache) Clear() {
+	for _, sh := range c.shards {
+		sh.mu.Lock()
+
+		sh.items = make(map[uint32]*Item)
+
+		for i := range sh.ringBuf {
+			sh.ringBuf[i] = ringNode{}
+		}
+
+		sh.ringHead = 0
+
+		sh.mu.Unlock()
+	}
+}
