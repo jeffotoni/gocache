@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="650" viewBox="0 0 1100 650" role="img" aria-labelledby="title desc">
+  <title id="title">gocache New versus NewFast standardized benchmark</title>
+  <desc id="desc">Nanoseconds per operation for Set, Set/Get, Get hit and Get miss on an Apple M3 Max.</desc>
+  <rect width="1100" height="650" fill="#f7f8fa"/>
+  <text x="70" y="52" fill="#17202a" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="28" font-weight="700">gocache: New vs NewFast</text>
+  <text x="70" y="82" fill="#5b6573" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="15">Lower is better | ns/op | same benchmark suite | Apple M3 Max | benchtime=3s</text>
+
+  <g stroke="#d8dde5" stroke-width="1">
+    <line x1="90" y1="500" x2="1040" y2="500"/>
+    <line x1="90" y1="412.5" x2="1040" y2="412.5"/>
+    <line x1="90" y1="325" x2="1040" y2="325"/>
+    <line x1="90" y1="237.5" x2="1040" y2="237.5"/>
+    <line x1="90" y1="150" x2="1040" y2="150"/>
+  </g>
+  <g fill="#687384" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13" text-anchor="end">
+    <text x="80" y="505">0</text>
+    <text x="80" y="417.5">35</text>
+    <text x="80" y="330">70</text>
+    <text x="80" y="242.5">105</text>
+    <text x="80" y="155">140</text>
+  </g>
+  <line x1="90" y1="500" x2="90" y2="150" stroke="#8a94a3" stroke-width="1.5"/>
+
+  <g fill="#2774c6">
+    <rect x="145" y="301.45" width="55" height="198.55" rx="4"/>
+    <rect x="385" y="170.50" width="55" height="329.50" rx="4"/>
+    <rect x="625" y="353.33" width="55" height="146.67" rx="4"/>
+    <rect x="865" y="467.78" width="55" height="32.22" rx="4"/>
+  </g>
+  <g fill="#ef8b2c">
+    <rect x="205" y="333.50" width="55" height="166.50" rx="4"/>
+    <rect x="445" y="222.50" width="55" height="277.50" rx="4"/>
+    <rect x="685" y="363.33" width="55" height="136.67" rx="4"/>
+    <rect x="925" y="472.35" width="55" height="27.65" rx="4"/>
+  </g>
+
+  <g fill="#17202a" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="14" text-anchor="middle">
+    <text x="202" y="535">Set</text>
+    <text x="442" y="535">Set/Get</text>
+    <text x="682" y="535">Get hit</text>
+    <text x="922" y="535">Get miss</text>
+  </g>
+  <g fill="#2774c6" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13" text-anchor="middle">
+    <text x="172" y="292">79.42</text>
+    <text x="412" y="161">131.8</text>
+    <text x="652" y="344">58.67</text>
+    <text x="892" y="458">12.89</text>
+  </g>
+  <g fill="#b76416" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13" text-anchor="middle">
+    <text x="232" y="324">66.60</text>
+    <text x="472" y="213">111.0</text>
+    <text x="712" y="354">54.67</text>
+    <text x="952" y="463">11.06</text>
+  </g>
+
+  <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="14">
+    <rect x="90" y="580" width="18" height="18" rx="3" fill="#2774c6"/>
+    <text x="118" y="594" fill="#17202a">New (safe default)</text>
+    <rect x="300" y="580" width="18" height="18" rx="3" fill="#ef8b2c"/>
+    <text x="328" y="594" fill="#17202a">NewFast (legacy hash-only)</text>
+  </g>
+</svg>

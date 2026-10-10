@@ -85,80 +85,245 @@ func main() {
 }
 ```
 
-## ⚡ Benchmark Results now with Risttreto, BigCache, Go-cache e Freecache
-
-### 🚀 5-Second Benchmarks
-
-| **Implementation**     | **Set Ops**     | **Set ns/op** | **Set/Get Ops** | **Set/Get ns/op** | **Observations**                                 |
-|------------------------|------------------|----------------|------------------|--------------------|--------------------------------------------------|
-| **gocache V1**         | 28,414,197       | 338.6 ns/op    | 22,687,808       | 294.9 ns/op        | Baseline version — decent speed, moderate allocs |
-| **gocache V8**         | 26,022,742       | 364.5 ns/op    | 15,105,789       | 393.6 ns/op        | High memory cost, TTL enabled                    |
-| **gocache V9**         | 44,026,141       | 265.4 ns/op    | 23,528,972       | 270.0 ns/op        | 🏆 **Fastest write throughput**                  |
-| **gocache V10**        | 19,749,439       | 393.2 ns/op    | 16,217,510       | 495.9 ns/op        | ❌ Higher allocation and latency                  |
-| **gocache V11 (Short)**| 39,719,458       | 264.2 ns/op    | 23,308,189       | 265.4 ns/op        | ⚡ Short TTL — very fast overall                  |
-| **gocache V11 (Long)** | 22,334,095       | 348.8 ns/op    | 18,338,124       | 319.7 ns/op        | Balanced long TTL setup                          |
-| **go-cache**           | 25,669,981       | 392.5 ns/op    | 20,485,022       | 306.0 ns/op        | Stable, but slower than newer gocache versions   |
-| **freecache**          | 41,543,706       | 380.3 ns/op    | 14,433,577       | 425.2 ns/op        | 🚀 Fast writes, significantly slower reads        |
-| **ristretto**          | 30,257,541       | 352.3 ns/op    | 10,055,701       | 547.8 ns/op        | 🧠 TinyLFU eviction, high allocation per op       |
-| **bigcache**           | 30,260,250       | 320.6 ns/op    | 14,382,721       | 354.6 ns/op        | 🔥 Very consistent, low GC overhead               |
-
-
-![Cache Benchmark Comparison](./graphic-v1.png)
-
-
-### 🚀 1-Second Benchmarks
-
-```go
-$ go test -bench=. -benchtime=1s
-```
-
-| **Implementation** | **Set Ops**    | **Set ns/op** | **Set/Get Ops** | **Set/Get ns/op** | **Observations**                      |
-|--------------------|----------------|---------------|-----------------|-------------------|---------------------------------------|
-| **gocache V7**     | 8,026,825      | 222.4 ns/op   | 4,978,083       | 244.3 ns/op       | 🏆 **Best write** (1s), fast reads    |
-| **gocache V9**     | 9,295,434      | 215.9 ns/op   | 5,096,511       | 272.7 ns/op       | 🏆 **Fastest write** (lowest ns/op)   |
-| **go-cache**       | 6,463,236      | 291.6 ns/op   | 4,698,109       | 290.7 ns/op       | Solid library, slower than V7/V9      |
-| **freecache**      | 5,803,242      | 351.1 ns/op   | 2,183,834       | 469.7 ns/op       | 🚀 Decent writes, poor reads          |
-
-### 🚀 3-Second Benchmarks
-
-| **Implementation** | **Set Ops**     | **Set ns/op** | **Get Ops**     | **Get ns/op** | **Observations**                     |
-|--------------------|-----------------|---------------|-----------------|---------------|--------------------------------------|
-| **gocache V7**     | 27,229,544      | 252.4 ns/op   | 14,574,768      | 268.6 ns/op   | 🏆 **Best write** (3s)               |
-| **gocache V9**     | 24,809,947      | 252.1 ns/op   | 13,225,228      | 275.7 ns/op   | 🏆 **Very fast write**, good read    |
-| **go-cache**       | 15,594,752      | 375.4 ns/op   | 14,289,182      | 269.7 ns/op   | 🚀 Excellent reads, slower writes    |
-| **freecache**      | 13,303,050      | 402.3 ns/op   | 8,903,779       | 421.4 ns/op   | ❌ Decent write, slow read           |
-
-#### 🚀 You can find all the benchmarks here [benchmark-gocache](https://github.com/jeffotoni/benchmark-gocache)
-
 # 🛠 API Reference
 
-New Cache
+## Safe cache: `New`
+
+`New` is the default API and the recommended choice. It stores the original
+key together with the hash, so different keys that produce the same hash remain
+independent. It also supports optional limits and statistics.
+
 ```go
-cache := gocache.New(10 * time.Minute) // Creates a cache with 10 min TTL
+cache := gocache.New(10 * time.Minute)
+defer cache.Close()
+
+cache.Set("employee:BR307836", "employee payload", gocache.DefaultExpiration)
+
+value, found := cache.Get("employee:BR307836")
+if found {
+    fmt.Println(value)
+}
+
+cache.Delete("employee:BR307836")
+cache.Clear()
 ```
 
-Set Value
+`DefaultExpiration` uses the TTL configured in `New`. Use
+`NoExpiration` for an item that remains until `Delete` or `Clear`:
+
 ```go
+cache.Set("geo:724:10:46", "Valencia", gocache.NoExpiration)
+cache.Set("temporary", "value", 30*time.Second)
+```
+
+## Capacity limits and statistics
+
+Use `NewWithOptions` when the cache needs a maximum number of entries or an
+approximate byte limit. `TrySet` returns `false` when a new item is rejected by
+one of those limits.
+
+```go
+cache := gocache.NewWithOptions(gocache.Options{
+    TTL:        24 * time.Hour,
+    MaxEntries: 10000,
+    MaxBytes:   64 * 1024 * 1024,
+    SizeFunc: func(key string, value interface{}) int64 {
+        payload, ok := value.([]byte)
+        if !ok {
+            return int64(len(key) + 64)
+        }
+        return int64(len(key) + len(payload))
+    },
+})
+defer cache.Close()
+
+stored := cache.TrySet("oracle:geo:724:10", []byte("46"), gocache.DefaultExpiration)
+if !stored {
+    fmt.Println("cache capacity reached")
+}
+
+stats := cache.Stats()
+fmt.Println("items:", stats.Items)
+fmt.Println("hits:", stats.Hits)
+fmt.Println("misses:", stats.Misses)
+fmt.Println("expired:", stats.Expired)
+fmt.Println("estimated bytes:", stats.EstimatedBytes)
+```
+
+`SizeFunc` is optional. Without it, the cache uses an approximate size based on
+the key and common value types. `EstimatedBytes` is an estimate, not a process
+RSS measurement.
+
+## Type-safe cache: `NewTyped`
+
+`NewTyped[T]` is a typed facade over the same safe v12 implementation. It keeps
+the collision protection of `New` while avoiding type assertions in the
+application code.
+
+```go
+type GeoResult struct {
+    CodDestino string
+}
+
+cache := gocache.NewTyped[GeoResult](gocache.NoExpiration)
+defer cache.Close()
+
+cache.Set("geo:724:10:46", GeoResult{CodDestino: "46"}, gocache.DefaultExpiration)
+
+result, found := cache.Get("geo:724:10:46")
+if found {
+    fmt.Println(result.CodDestino)
+}
+```
+
+`NewTypedWithOptions[T]` accepts the same limits and statistics options as
+`NewWithOptions`:
+
+```go
+cache := gocache.NewTypedWithOptions[GeoResult](gocache.Options{
+    TTL:        24 * time.Hour,
+    MaxEntries: 50000,
+})
+defer cache.Close()
+```
+
+The typed API provides `Set`, `TrySet`, `Get`, `Delete`, `Clear`, `Stats` and
+`Close`. On a miss, `Get` returns the zero value of `T` and `false`.
+
+## Fast legacy cache: `NewFast`
+
+`NewFast` is an explicit opt-in API for compatibility and benchmark
+comparisons. It delegates to `NewLegacyFast` and uses the older hash-only
+storage strategy.
+
+```go
+cache := gocache.NewFast(gocache.NoExpiration)
+defer cache.Close()
+
 cache.Set("key", "value", gocache.DefaultExpiration)
+value, found := cache.Get("key")
 ```
 
-Get Value
-```go
-val, found := cache.Get("key")
+### Important collision warning
+
+`NewFast` does **not** retain the original key. It stores one value per hash.
+If two different keys produce the same hash, the later `Set` can overwrite the
+first value. `Get` and `Delete` can then address the same hash entry even when
+the requested strings are different.
+
+```text
+Set("key-A", valueA) -> hash H -> valueA
+Set("key-B", valueB) -> hash H -> valueB replaces valueA
+Get("key-A")          -> hash H -> valueB
 ```
 
-Delete Value
-```go
-cache.Delete("key")
+This behavior is the trade-off for the legacy implementation's lower overhead.
+Use `New` or `NewTyped` for geographic mappings, employee records, Oracle
+results, or any data where the key must be exact. Use `NewFast` only when the
+caller accepts the collision risk.
+
+Both `New` and `NewFast` provide `Clear` and `Close`. Call `Close` when a cache
+with a positive TTL is no longer needed so its cleanup goroutine can stop.
+
+## Tests and coverage
+
+Run the test suite:
+
+```sh
+go test -v ./...
 ```
 
-## ⚖️ Trade-Offs & Performance
+Generate a coverage profile, print the function summary, and create an HTML
+report:
 
-✅ V7 and V9 provide the fastest write performance.
+```sh
+go test -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out
+go tool cover -html=coverage.out -o coverage.html
+```
 
-✅ go-cache excel in retrieval speed.
+On macOS, open the report with:
 
-❌ FreeCache struggles with read speed, despite having decent write speed.
+```sh
+open coverage.html
+```
+
+## Local benchmarks
+
+The repository benchmarks only gocache implementations. The common operation
+benchmarks compare the safe default `New` implementation against the explicit
+legacy `NewFast` implementation. No external cache library is included in
+these benchmarks.
+
+Run all gocache benchmarks with allocation metrics:
+
+```sh
+go test -run '^$' -bench '^BenchmarkGocache' -benchmem -benchtime=3s
+```
+
+Run only the main `New` versus `NewFast` comparison:
+
+```sh
+go test -run '^$' -bench '^BenchmarkGocache(New|Set|SetWithTTL|GetHit|GetMiss|SetGet|SetDelete|Clear)' -benchmem -benchtime=3s
+```
+
+The additional benchmarks for `TrySet`, `Stats` and `TypedCache` measure v12
+features that are not available in the legacy API. Benchmark results depend on
+the CPU, Go version, cache state and `-benchtime`, so compare implementations
+from the same command execution.
+
+## Current gocache results: `New` vs `NewFast`
+
+The following results were collected in the companion
+`benchmark-gocache` repository. All implementations used the same benchmark
+process, workload, machine and duration:
+
+```sh
+go test -run '^$' -bench '^BenchmarkCurrent' -benchmem -benchtime=3s -count=1
+```
+
+Environment: Apple M3 Max, arm64, Go 1.27.1. Lower `ns/op` is better.
+
+![gocache New versus NewFast](./graphic-gocache-new-vs-fast.svg)
+
+| Operation | New ns/op | New B/op | New allocs/op | NewFast ns/op | NewFast B/op | NewFast allocs/op |
+|-----------|----------:|---------:|--------------:|--------------:|-------------:|------------------:|
+| Set | 79.42 | 88 | 2 | 66.60 | 48 | 2 |
+| Set/Get | 131.8 | 88 | 2 | 111.0 | 48 | 2 |
+| Get hit | 58.67 | 0 | 0 | 54.67 | 0 | 0 |
+| Get miss | 12.89 | 0 | 0 | 11.06 | 0 | 0 |
+
+The safe `New` implementation is slower because it preserves and compares the
+original key, allowing multiple keys with the same hash to coexist correctly.
+`NewFast` is faster because it stores one value per hash, but that is also its
+correctness limitation. The two implementations must not be treated as
+interchangeable when exact key isolation is required.
+
+### Compatible reference table
+
+This table uses the same four operations for every implementation. The
+external caches were executed by the same `benchmark-gocache` benchmark suite,
+not copied from older benchmark runs.
+
+| Implementation | Set ns/op | Set/Get ns/op | Get hit ns/op | Get miss ns/op |
+|----------------|----------:|--------------:|--------------:|---------------:|
+| gocache New | 79.42 | 131.8 | 58.67 | 12.89 |
+| gocache NewFast | 66.60 | 111.0 | 54.67 | 11.06 |
+| go-cache | 57.03 | 92.29 | 39.82 | 3.798 |
+| freecache | 56.55 | 118.6 | 72.82 | 15.45 |
+| ristretto | 285.5 | 934.0 | 64.29 | 38.48 |
+| bigcache | 107.5 | 150.1 | 54.39 | 17.19 |
+
+![gocache full benchmark comparison](./graphic-gocache-comparison.svg)
+
+Allocation results from the same run are available in the companion repository
+file `benchmark-current.txt`. Benchmark numbers are hardware and workload
+dependent; use the command above when reproducing them.
+
+## Benchmark repository
+
+The complete benchmark suite, raw output and implementation comparisons are
+available in [benchmark-gocache](https://github.com/jeffotoni/benchmark-gocache).
 
 ## 🤝 Contributing
 
@@ -178,4 +343,3 @@ This project is **open-source** under the **MIT License**.
 
 💡 Feel free to **fork, modify, and experiment** with these benchmarks in your own applications or libraries.  
 🔬 The goal is to **help developers choose the best in-memory cache** for their needs.
-
