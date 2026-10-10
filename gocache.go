@@ -1,191 +1,471 @@
-// Package gocache provides a high-performance in-memory cache with expiration handling.
-// It is designed for applications that require fast data retrieval with minimal contention.
-//
-// Features:
-// - Concurrent access using sharding to reduce lock contention.
-// - Configurable TTL (Time-To-Live) for automatic expiration of cached items.
-// - Support for permanent (no expiration) cache entries.
-// - Optimized cleanup process to remove expired items efficiently.
+// Package gocache provides a sharded in-memory cache with expiration handling.
 package gocache
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	// DefaultExpiration uses the cache's default TTL if no specific expiration is set.
+	// DefaultExpiration uses the cache default TTL.
 	DefaultExpiration time.Duration = 0
 
-	// NoExpiration indicates that the cached item should never expire.
+	// NoExpiration keeps an item until it is deleted or the cache is cleared.
 	NoExpiration time.Duration = -1
 
-	// numShards defines the number of cache partitions to allow concurrent access.
 	numShards = 8
-
-	// ringSize sets the size of the expiration ring buffer for tracking expired items.
-	ringSize = 4096
+	ringSize  = 4096
 )
 
-// ringNode represents an entry in the expiration ring buffer.
+// Options configures optional cache limits and observability.
+type Options struct {
+	TTL        time.Duration
+	MaxEntries int
+	MaxBytes   int64
+	SizeFunc   func(key string, value interface{}) int64
+}
+
+// Stats contains cache counters and approximate memory usage.
+type Stats struct {
+	Items          int
+	Hits           uint64
+	Misses         uint64
+	Expired        uint64
+	Collisions     uint64
+	EstimatedBytes int64
+}
+
+// ringNode tracks one expiring version of one exact key.
 type ringNode struct {
-	key     uint32 // Hashed key
-	expires int64  // Expiration timestamp in nanoseconds
+	hash       uint32
+	key        string
+	expires    int64
+	generation uint64
 }
 
-// shard is a partition of the cache with its own locking mechanism.
+// shard partitions cache writes and reads.
 type shard struct {
-	mu       sync.RWMutex     // Mutex for concurrent access
-	items    map[uint32]*Item // Cached items
-	ringBuf  []ringNode       // Ring buffer for tracking expiration
-	ringHead int              // Current position in the ring buffer
+	mu       sync.RWMutex
+	items    map[uint32][]*Item
+	ringBuf  []ringNode
+	ringHead int
 }
 
-// Item represents a single cache entry.
+// Item represents a cached value.
 type Item struct {
-	value   interface{} // Stored value
-	expires int64       // Expiration timestamp
+	key        string
+	value      interface{}
+	expires    int64
+	generation uint64
+	size       int64
 }
 
-// Cache is a sharded in-memory cache with expiration handling.
+// Cache is a sharded in-memory cache.
 type Cache struct {
-	shards [numShards]*shard // Array of shards to reduce contention
-	ttl    time.Duration     // Default time-to-live for cache entries
+	shards [numShards]*shard
+	ttl    time.Duration
+
+	maxEntries int
+	maxBytes   int64
+	sizeFunc   func(key string, value interface{}) int64
+
+	capacityMu sync.Mutex
+
+	generation atomic.Uint64
+	entries    atomic.Int64
+	bytes      atomic.Int64
+	hits       atomic.Uint64
+	misses     atomic.Uint64
+	expired    atomic.Uint64
+	collisions atomic.Uint64
+
+	stop        chan struct{}
+	closeOnce   sync.Once
+	cleanupDone chan struct{}
 }
 
-// New creates a new instance of Cache with the specified default TTL.
-// If the TTL is greater than 0, a cleanup goroutine is started to periodically remove expired items.
+// New preserves the original constructor API.
 func New(ttlStr ...time.Duration) *Cache {
 	var ttl time.Duration
 	if len(ttlStr) > 0 {
-		// Use the first duration provided
 		ttl = ttlStr[0]
-	} else {
-		// Fallback to DefaultExpiration if no parameter is passed
-		ttl = DefaultExpiration
 	}
-	c := &Cache{ttl: ttl}
+	return NewWithOptions(Options{TTL: ttl})
+}
+
+// NewWithOptions creates a cache with optional limits and statistics sizing.
+func NewWithOptions(options Options) *Cache {
+	cache := &Cache{
+		ttl:         options.TTL,
+		maxEntries:  options.MaxEntries,
+		maxBytes:    options.MaxBytes,
+		sizeFunc:    options.SizeFunc,
+		stop:        make(chan struct{}),
+		cleanupDone: make(chan struct{}),
+	}
+	if cache.sizeFunc == nil {
+		cache.sizeFunc = defaultSize
+	}
+
 	for i := 0; i < numShards; i++ {
-		c.shards[i] = &shard{
-			items:   make(map[uint32]*Item),
+		cache.shards[i] = &shard{
+			items:   make(map[uint32][]*Item),
 			ringBuf: make([]ringNode, ringSize),
 		}
 	}
-	if ttl > 0 {
-		go c.cleanup()
+
+	if cache.ttl > 0 {
+		go cache.cleanup()
+	} else {
+		close(cache.cleanupDone)
 	}
-	return c
+
+	return cache
 }
 
-// hashKey computes a simple FNV-1a hash from the string key.
-// The hash ensures even distribution across shards.
-func (c *Cache) hashKey(key string) uint32 {
-	var h uint32
+func defaultSize(key string, value interface{}) int64 {
+	size := int64(len(key) + 64)
+	switch typedValue := value.(type) {
+	case string:
+		size += int64(len(typedValue))
+	case []byte:
+		size += int64(len(typedValue))
+	}
+	return size
+}
+
+func (cache *Cache) hashKey(key string) uint32 {
+	var hash uint32 = 2166136261
 	for i := 0; i < len(key); i++ {
-		h ^= uint32(key[i])
-		h *= 16777619
+		hash ^= uint32(key[i])
+		hash *= 16777619
 	}
-	return h
+	return hash
 }
 
-// getShard selects the shard based on the hashed key.
-// This helps in distributing load and reducing lock contention.
-func (c *Cache) getShard(k uint32) *shard {
-	return c.shards[k%numShards]
+func (cache *Cache) getShard(hash uint32) *shard {
+	return cache.shards[hash%numShards]
 }
 
-// Set inserts a value into the cache with an optional TTL.//
-// If `ttl` is set to `DefaultExpiration`, the cache's default TTL is applied.
-// If `ttl` is set to `NoExpiration`, the item never expires.
-func (c *Cache) Set(key string, value interface{}, ttl time.Duration) {
-	var exp int64
+func (cache *Cache) expiration(ttl time.Duration) int64 {
 	if ttl == DefaultExpiration {
-		ttl = c.ttl
+		ttl = cache.ttl
 	}
-	if ttl > 0 {
-		exp = time.Now().Add(ttl).UnixNano()
+	if ttl <= 0 {
+		return 0
 	}
-
-	hashed := c.hashKey(key)
-	sh := c.getShard(hashed)
-
-	sh.mu.Lock()
-	sh.items[hashed] = &Item{value: value, expires: exp}
-	sh.ringBuf[sh.ringHead] = ringNode{key: hashed, expires: exp}
-	sh.ringHead = (sh.ringHead + 1) % ringSize
-	sh.mu.Unlock()
+	return time.Now().Add(ttl).UnixNano()
 }
 
-// Get retrieves a value from the cache.//
-// Returns the stored value and a boolean indicating if the key was found.
-// If the item has expired, it is removed from the cache and (nil, false) is returned.
-func (c *Cache) Get(key string) (interface{}, bool) {
-	hashed := c.hashKey(key)
-	sh := c.getShard(hashed)
+func (cache *Cache) nextGeneration() uint64 {
+	return cache.generation.Add(1)
+}
+
+// Set inserts or replaces a value. Existing callers keep the original API.
+func (cache *Cache) Set(key string, value interface{}, ttl time.Duration) {
+	_ = cache.TrySet(key, value, ttl)
+}
+
+// TrySet inserts or replaces a value and reports whether it was stored.
+// It returns false when an optional capacity limit rejects a new entry.
+func (cache *Cache) TrySet(key string, value interface{}, ttl time.Duration) bool {
+	if cache == nil {
+		return false
+	}
+
+	hash := cache.hashKey(key)
+	item := &Item{
+		key:        key,
+		value:      value,
+		expires:    cache.expiration(ttl),
+		generation: cache.nextGeneration(),
+		size:       cache.sizeFunc(key, value),
+	}
+
+	if item.size < 0 {
+		item.size = 0
+	}
+
+	if cache.maxEntries <= 0 && cache.maxBytes <= 0 {
+		return cache.setUnbounded(hash, item)
+	}
+
+	cache.capacityMu.Lock()
+	defer cache.capacityMu.Unlock()
+	return cache.setBounded(hash, item)
+}
+
+func (cache *Cache) setUnbounded(hash uint32, item *Item) bool {
+	sh := cache.getShard(hash)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	bucket := sh.items[hash]
+	index := findItem(bucket, item.key)
+	if index >= 0 {
+		previous := bucket[index]
+		bucket[index] = item
+		cache.bytes.Add(item.size - previous.size)
+		cache.addRingNode(sh, hash, item)
+		return true
+	}
+
+	if len(bucket) > 0 {
+		cache.collisions.Add(1)
+	}
+	sh.items[hash] = append(bucket, item)
+	cache.entries.Add(1)
+	cache.bytes.Add(item.size)
+	cache.addRingNode(sh, hash, item)
+	return true
+}
+
+func (cache *Cache) setBounded(hash uint32, item *Item) bool {
+	sh := cache.getShard(hash)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	bucket := sh.items[hash]
+	index := findItem(bucket, item.key)
+	if index >= 0 {
+		previous := bucket[index]
+		newBytes := cache.bytes.Load() - previous.size + item.size
+		if cache.maxBytes > 0 && newBytes > cache.maxBytes {
+			return false
+		}
+		bucket[index] = item
+		cache.bytes.Store(newBytes)
+		cache.addRingNode(sh, hash, item)
+		return true
+	}
+
+	if cache.maxEntries > 0 && int(cache.entries.Load()) >= cache.maxEntries {
+		return false
+	}
+	if cache.maxBytes > 0 && cache.bytes.Load()+item.size > cache.maxBytes {
+		return false
+	}
+
+	if len(bucket) > 0 {
+		cache.collisions.Add(1)
+	}
+	sh.items[hash] = append(bucket, item)
+	cache.entries.Add(1)
+	cache.bytes.Add(item.size)
+	cache.addRingNode(sh, hash, item)
+	return true
+}
+
+func (cache *Cache) addRingNode(sh *shard, hash uint32, item *Item) {
+	if item.expires <= 0 {
+		return
+	}
+	sh.ringBuf[sh.ringHead] = ringNode{
+		hash:       hash,
+		key:        item.key,
+		expires:    item.expires,
+		generation: item.generation,
+	}
+	sh.ringHead = (sh.ringHead + 1) % ringSize
+}
+
+func findItem(bucket []*Item, key string) int {
+	for index, item := range bucket {
+		if item.key == key {
+			return index
+		}
+	}
+	return -1
+}
+
+// Get retrieves a value and reports whether it exists and is not expired.
+func (cache *Cache) Get(key string) (interface{}, bool) {
+	if cache == nil {
+		return nil, false
+	}
+
+	hash := cache.hashKey(key)
+	sh := cache.getShard(hash)
 
 	sh.mu.RLock()
-	item, exists := sh.items[hashed]
+	bucket := sh.items[hash]
+	index := findItem(bucket, key)
+	if index < 0 {
+		sh.mu.RUnlock()
+		cache.misses.Add(1)
+		return nil, false
+	}
+
+	item := bucket[index]
+	now := time.Now().UnixNano()
+	if item.expires > 0 && now >= item.expires {
+		generation := item.generation
+		sh.mu.RUnlock()
+		cache.expired.Add(1)
+		cache.misses.Add(1)
+		cache.deleteIfGeneration(hash, key, generation)
+		return nil, false
+	}
+
+	value := item.value
 	sh.mu.RUnlock()
-
-	if !exists {
-		return nil, false
-	}
-
-	if item.expires > 0 && time.Now().UnixNano() > item.expires {
-		c.Delete(key) // Remove expired item
-		return nil, false
-	}
-
-	return item.value, true
+	cache.hits.Add(1)
+	return value, true
 }
 
-// Delete removes an item from the cache.//
-// If the key does not exist, no action is taken.
-func (c *Cache) Delete(key string) {
-	hashed := c.hashKey(key)
-	sh := c.getShard(hashed)
+func (cache *Cache) deleteIfGeneration(hash uint32, key string, generation uint64) {
+	if cache.maxEntries > 0 || cache.maxBytes > 0 {
+		cache.capacityMu.Lock()
+		defer cache.capacityMu.Unlock()
+	}
+	cache.deleteIfGenerationLocked(hash, key, generation)
+}
 
+func (cache *Cache) deleteIfGenerationLocked(hash uint32, key string, generation uint64) {
+	sh := cache.getShard(hash)
 	sh.mu.Lock()
-	delete(sh.items, hashed)
-	sh.mu.Unlock()
+	defer sh.mu.Unlock()
+
+	bucket := sh.items[hash]
+	index := findItem(bucket, key)
+	if index < 0 || bucket[index].generation != generation {
+		return
+	}
+	cache.removeItemLocked(sh, hash, index)
 }
 
-// cleanup runs periodically to remove expired items from the cache.//
-// This function runs as a background goroutine and checks for expired items
-// at intervals of `ttl / 2`, ensuring efficient memory management.
-func (c *Cache) cleanup() {
-	tick := time.NewTicker(c.ttl / 2)
-	defer tick.Stop()
+func (cache *Cache) removeItemLocked(sh *shard, hash uint32, index int) {
+	bucket := sh.items[hash]
+	removed := bucket[index]
+	copy(bucket[index:], bucket[index+1:])
+	bucket[len(bucket)-1] = nil
+	bucket = bucket[:len(bucket)-1]
 
-	for range tick.C {
-		now := time.Now().UnixNano()
-		for _, sh := range c.shards {
-			sh.mu.Lock()
-			for i := 0; i < ringSize; i++ {
-				node := &sh.ringBuf[i]
-				if node.expires > 0 && now > node.expires {
-					delete(sh.items, node.key)
-					node.expires = 0
+	if len(bucket) == 0 {
+		delete(sh.items, hash)
+	} else {
+		sh.items[hash] = bucket
+	}
+	cache.entries.Add(-1)
+	cache.bytes.Add(-removed.size)
+}
+
+// Delete removes an exact key without affecting colliding keys.
+func (cache *Cache) Delete(key string) {
+	if cache == nil {
+		return
+	}
+
+	hash := cache.hashKey(key)
+	if cache.maxEntries > 0 || cache.maxBytes > 0 {
+		cache.capacityMu.Lock()
+		defer cache.capacityMu.Unlock()
+	}
+
+	sh := cache.getShard(hash)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	index := findItem(sh.items[hash], key)
+	if index >= 0 {
+		cache.removeItemLocked(sh, hash, index)
+	}
+}
+
+func (cache *Cache) cleanup() {
+	interval := cache.ttl / 2
+	if interval <= 0 {
+		interval = cache.ttl
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	defer close(cache.cleanupDone)
+
+	for {
+		select {
+		case <-ticker.C:
+			cache.cleanupExpired(time.Now().UnixNano())
+		case <-cache.stop:
+			return
+		}
+	}
+}
+
+func (cache *Cache) cleanupExpired(now int64) {
+	if cache.maxEntries > 0 || cache.maxBytes > 0 {
+		cache.capacityMu.Lock()
+		defer cache.capacityMu.Unlock()
+	}
+
+	for _, sh := range cache.shards {
+		sh.mu.Lock()
+		for index := range sh.ringBuf {
+			node := &sh.ringBuf[index]
+			if node.expires <= 0 || now < node.expires {
+				continue
+			}
+
+			bucket := sh.items[node.hash]
+			itemIndex := findItem(bucket, node.key)
+			if itemIndex >= 0 {
+				item := bucket[itemIndex]
+				if item.generation == node.generation &&
+					item.expires > 0 &&
+					item.expires <= now {
+					cache.removeItemLocked(sh, node.hash, itemIndex)
 				}
 			}
-			sh.mu.Unlock()
+			*node = ringNode{}
 		}
+		sh.mu.Unlock()
 	}
 }
 
-// Clear removes all keys from all shards and resets the ring buffers.
-func (c *Cache) Clear() {
-	for _, sh := range c.shards {
+// Close stops the optional cleanup goroutine.
+func (cache *Cache) Close() {
+	if cache == nil {
+		return
+	}
+	cache.closeOnce.Do(func() {
+		close(cache.stop)
+	})
+	<-cache.cleanupDone
+}
+
+// Clear removes all keys and resets the ring buffers.
+func (cache *Cache) Clear() {
+	if cache == nil {
+		return
+	}
+	if cache.maxEntries > 0 || cache.maxBytes > 0 {
+		cache.capacityMu.Lock()
+		defer cache.capacityMu.Unlock()
+	}
+
+	for _, sh := range cache.shards {
 		sh.mu.Lock()
-
-		sh.items = make(map[uint32]*Item)
-
-		for i := range sh.ringBuf {
-			sh.ringBuf[i] = ringNode{}
+		sh.items = make(map[uint32][]*Item)
+		for index := range sh.ringBuf {
+			sh.ringBuf[index] = ringNode{}
 		}
-
 		sh.ringHead = 0
-
 		sh.mu.Unlock()
+	}
+	cache.entries.Store(0)
+	cache.bytes.Store(0)
+}
+
+func (cache *Cache) Stats() Stats {
+	if cache == nil {
+		return Stats{}
+	}
+	return Stats{
+		Items:          int(cache.entries.Load()),
+		Hits:           cache.hits.Load(),
+		Misses:         cache.misses.Load(),
+		Expired:        cache.expired.Load(),
+		Collisions:     cache.collisions.Load(),
+		EstimatedBytes: cache.bytes.Load(),
 	}
 }
